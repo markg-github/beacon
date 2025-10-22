@@ -10,12 +10,32 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use zbus::Connection;
 
+use tracing::{event, Level};
+use tracing::{info, debug, warn, error};
+// use tracing_subscriber::{filter, fmt::time, EnvFilter, prelude::*};
+use tracing_subscriber::{filter, fmt::time, prelude::*};
+// use tracing_subscriber::fmt::time;
+// use tracing_subscriber::filter;
+// use tracing_subscriber::fmt::time;
+// use tracing_subscriber::fmt;
+use anyhow::Error;
+// use tracing_appender::{non_blocking, rolling};
+use tracing_appender::rolling;
+use std::io;
+use std::path;
+use std::env;
+
+
 use crate::avahi::Avahi;
 
 #[derive(Parser)]
 #[command(name = std::env!("CARGO_PKG_NAME"))]
 #[command(about = std::env!("CARGO_PKG_DESCRIPTION"))]
 struct Cli {
+    /// Suppress output to terminal (logs still write to file)
+    #[arg(long)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -83,23 +103,26 @@ impl TryFrom<Cli> for Action {
 }
 
 impl Action {
+    #[tracing::instrument(skip(self, url))]
     async fn perform(&self, url: &str) -> Result<bool, Box<dyn std::error::Error>> {
-        // Send the appropriate request based on action
+        debug!(%url, "sending request to dispatch");
         let response = match self {
             Action::Boot => Client::new().post(url).send().await?,
             Action::Report(report) => Client::new().put(url).json(report).send().await?,
         };
-
-        // Handle the response
-        match response.status() {
-            // This is the normal error when the service worked,
-            // but no task was found for our IP address. This either
-            // means that there is no job or that we need to contact
-            // the server on a different address. Skip.
-            StatusCode::EXPECTATION_FAILED => Ok(false),
-            StatusCode::OK => Ok(true),
-            status => {
-                eprintln!("warning: {status}");
+        let status = response.status();
+        debug!(%url, %status, "received response");
+        match status {
+            StatusCode::EXPECTATION_FAILED => {
+                debug!(%url, "dispatch replied: no task for this IP (wrong instance or no job)");
+                Ok(false)
+            }
+            StatusCode::OK => {
+                info!(%url, "dispatch accepted request");
+                Ok(true)
+            }
+            s => {
+                warn!(%url, code = ?s, "unexpected status from dispatch");
                 Ok(false)
             }
         }
@@ -129,13 +152,67 @@ const BROWSER_TIMEOUT: Duration = Duration::from_secs(10);
 // Avahi D-Bus proxy interfaces
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let action: Action = Cli::parse().try_into()?;
 
-    for url in uefi::find_urls().await? {
+    // Set up file appender in the system's temp directory
+    // let file_appender = tracing_appender::rolling::RollingFileAppender::new(
+    //     tracing_appender::rolling::RollingFileAppenderBuilder::new()
+    //         .rotation(tracing_appender::rolling::Rotation::DAILY)
+    //         .filename_prefix("beacon")
+    //         .filename_suffix("log")
+    //         .build()
+    // );
+
+    // Create subscriber builder with common settings
+    // let subscriber = tracing_subscriber::fmt()
+    //     .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
+    //         .add_directive(tracing::Level::INFO.into())  // Default level
+    //     )
+    //     .with_thread_ids(true)
+    //     .with_target(false)
+    //     .with_file(true)
+    //     .with_line_number(true)
+    //     .with_writer(file_appender);  // Always write to file
+
+    // Parse CLI early to check for --quiet
+    let cli = Cli::parse();
+
+    // If not quiet, also write to stdout with less verbose settings
+    // if !cli.quiet {
+    //     subscriber
+    //         .with_writer(std::io::stdout)
+    //         .with_file(false)
+    //         .with_line_number(false)
+    //         .with_thread_ids(false)
+    //         .init();
+    // } else {
+    //     subscriber.init();
+    // }
+
+    setup_logging_to_stderr_and_rolling_file("beacon", cli.quiet).unwrap();
+    test_tracing_fn();
+
+
+    let action: Action = cli.try_into()?;
+
+    // let action: Action = Cli::parse().try_into()?;
+    info!(?action, "beacon starting");
+
+    let uefi_urls = uefi::find_urls().await?;
+    info!(count = uefi_urls.len(), "found uefi-provided URLs");
+    for url in uefi_urls {
+        info!(%url, "trying UEFI-provided dispatch URL");
         match action.perform(&url).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => continue,
-            Err(e) => eprintln!("error: {}: {}", url, e),
+            Ok(true) => {
+                info!(%url, "dispatch accepted request");
+                return Ok(());
+            }
+            Ok(false) => {
+                debug!(%url, "dispatch did not accept request (no task or wrong instance)");
+                continue;
+            }
+            Err(e) => {
+                error!(%url, %e, "error contacting dispatch");
+            }
         }
     }
 
@@ -148,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match resolved {
             Ok(resolved) => {
+                info!(service = %resolved.service.name, address = %resolved.address, "resolved dispatch service");
                 match resolved.address.ip() {
                     addr if addr.is_loopback() => continue,
                     IpAddr::V4(ipv4) if ipv4.is_link_local() => continue,
@@ -160,16 +238,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(path) => format!("http://{}{}", resolved.address, path),
                     None => continue,
                 };
+                info!(%url, "trying Avahi-discovered dispatch URL");
                 match action.perform(&url).await {
-                    Ok(true) => std::process::exit(0),
-                    Ok(false) => continue,
-
-                    Err(e) => eprintln!("error: {}: {}", url, e),
+                    Ok(true) => {
+                        info!(%url, "dispatch accepted request");
+                        std::process::exit(0);
+                    }
+                    Ok(false) => {
+                        debug!(%url, "dispatch did not accept request (no task or wrong instance)");
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(%url, %e, "error contacting dispatch");
+                    }
                 }
             }
-            Err(e) => eprintln!("Warning: Resolve failed: {e}"),
+            Err(e) => warn!(%e, "Avahi resolve failed")
         }
     }
 
+    error!("no dispatch services found");
     Err("no dispatch services found".into())
+}
+
+pub fn setup_logging_to_stderr_and_rolling_file(
+    filename_prefix: &str,
+    quiet: bool,
+) -> Result<(), Error> {
+    let stderr_log_level = filter::LevelFilter::INFO;
+    // let stderr_layer = tracing_subscriber::fmt::layer()
+    //     .pretty()
+    //     .with_writer(io::stderr);
+
+    let tmp_dir = get_tmp_dir();
+
+    let file_layer = tracing_subscriber::fmt::layer().pretty().with_writer(
+        rolling::RollingFileAppender::builder()
+            .rotation(rolling::Rotation::DAILY)
+            .filename_prefix(filename_prefix)
+            .filename_suffix("log")
+            .build(&tmp_dir)?,
+    );
+
+    // Build the registry conditionally including the stderr layer.
+    // Build a stderr layer that is either disabled (quiet) or writes to stderr.
+    let stderr_layer = if quiet {
+        // disabled layer with OFF filter
+        tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_writer(io::stderr)
+            .with_timer(time::ChronoLocal::rfc_3339())
+            .with_filter(filter::LevelFilter::OFF)
+    } else {
+        tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_writer(io::stderr)
+            .with_timer(time::ChronoLocal::rfc_3339())
+            .with_filter(stderr_log_level)
+    };
+
+    // Attach timer and filtering to the file layer and compose the subscriber.
+    let registry = tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(
+            file_layer
+                .with_timer(time::ChronoLocal::rfc_3339())
+                .with_ansi(false)
+                .with_filter(filter::LevelFilter::DEBUG),
+        );
+
+    registry.try_init()?;
+
+    let log_dir_abs_path = match path::Path::new(&tmp_dir).canonicalize() {
+        Ok(v) => v,
+        Err(_) => path::PathBuf::from(tmp_dir),
+    };
+
+    event!(Level::INFO, "log dir = {}", log_dir_abs_path.display());
+
+    Ok(())
+}
+
+#[tracing::instrument(level = tracing::Level::INFO)]
+fn test_tracing_fn() {
+    tracing::trace!("This is a trace message");
+    tracing::debug!("This is a debug message");
+    tracing::info!("This is an info message");
+    tracing::warn!("This is a warning message");
+    tracing::error!("This is an error message");
+}
+
+fn get_tmp_dir() -> String {
+    match env::var("TMPDIR").or_else(|_| env::var("TEMP")) {
+        Ok(v) => v,
+        Err(_) => "log".into(),
+    }
 }

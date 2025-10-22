@@ -20,6 +20,11 @@ zbus = { version = "5.11", default-features = false, features = ["tokio"] }
 tokio-stream = "0.1"
 devpath = "1.0.1"
 futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono"] }
+tracing-appender = "0.2"
+anyhow = "1.0.100"
+filter = "0.2.0"
 
 [profile.release]
 codegen-units = 1
