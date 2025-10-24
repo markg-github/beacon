@@ -220,8 +220,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let avahi = Avahi::new(&connection).await?;
 
     let mut browsing = avahi.browse(-1, -1, "_dispatch._tcp", "local", 0).await?;
+    info!(service_type = "_dispatch._tcp", domain = "local", "started Avahi browse");
     while let Ok(Some(item)) = timeout(BROWSER_TIMEOUT, browsing.next()).await {
-        let resolved = timeout(RESOLVER_TIMEOUT, avahi.resolve(item)).await?;
+        info!(?item, "Avahi browse discovered an item");
+        debug!(timeout = ?RESOLVER_TIMEOUT, "starting resolve for discovered item");
+
+        // Run the resolve with an explicit match so we can log timeouts instead of
+        // letting the `?` propagate and exit the program without context.
+        let resolved = match timeout(RESOLVER_TIMEOUT, avahi.resolve(item)).await {
+            Ok(inner_result) => {
+                debug!("Avahi resolve completed (inner result available)");
+                inner_result // this is the inner Result<Resolved, Error>
+            }
+            Err(elapsed) => {
+                warn!(?elapsed, "Avahi resolve timed out; continuing browse");
+                continue;
+            }
+        };
 
         match resolved {
             Ok(resolved) => {
