@@ -189,32 +189,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // }
 
     setup_logging_to_stderr_and_rolling_file("beacon", cli.quiet).unwrap();
-    test_tracing_fn();
 
 
     let action: Action = cli.try_into()?;
 
+    test_tracing_fn();
     // let action: Action = Cli::parse().try_into()?;
     info!(?action, "beacon starting");
 
-    // let uefi_urls = uefi::find_urls().await?;
-    // info!(count = uefi_urls.len(), "found uefi-provided URLs");
-    // for url in uefi_urls {
-    //     info!(%url, "trying UEFI-provided dispatch URL");
-    //     match action.perform(&url).await {
-    //         Ok(true) => {
-    //             info!(%url, "dispatch accepted request");
-    //             return Ok(());
-    //         }
-    //         Ok(false) => {
-    //             debug!(%url, "dispatch did not accept request (no task or wrong instance)");
-    //             continue;
-    //         }
-    //         Err(e) => {
-    //             error!(%url, %e, "error contacting dispatch");
-    //         }
-    //     }
-    // }
+    let uefi_urls = uefi::find_urls().await?;
+    info!(count = uefi_urls.len(), "found uefi-provided URLs");
+    for url in uefi_urls {
+        info!(%url, "trying UEFI-provided dispatch URL");
+        match action.perform(&url).await {
+            Ok(true) => {
+                info!(%url, "dispatch accepted request");
+                return Ok(());
+            }
+            Ok(false) => {
+                debug!(%url, "dispatch did not accept request (no task or wrong instance)");
+                continue;
+            }
+            Err(e) => {
+                error!(%url, %e, "error contacting dispatch");
+            }
+        }
+    }
 
     let connection = Connection::system().await?;
     let avahi = Avahi::new(&connection).await?;
