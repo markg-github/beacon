@@ -197,7 +197,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let action: Action = Cli::parse().try_into()?;
     info!(?action, "beacon starting");
 
-    let uefi_urls = uefi::find_urls().await?;
+    let uefi_urls = match uefi::find_urls().await {
+        Ok(urls) => urls,
+        Err(e) => {
+            warn!(%e, "UEFI URL discovery failed; continuing without UEFI URLs");
+            Vec::new()
+        }
+    };
+
     info!(count = uefi_urls.len(), "found uefi-provided URLs");
     for url in uefi_urls {
         info!(%url, "trying UEFI-provided dispatch URL");
